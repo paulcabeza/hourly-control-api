@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_
-from datetime import datetime, timedelta
-from typing import List
+from sqlalchemy import select, and_, func
+from datetime import datetime, timedelta, date
+from typing import List, Optional
 from app.db.postgres_connector import get_async_session
 from app.marks.models import Mark, MarkType
 from app.marks.schemas import MarkCreate, MarkRead, MarkWithUser
@@ -169,4 +169,116 @@ async def get_user_marks(
     )
     marks = result.scalars().all()
     return marks
+
+
+@router.get("/weekly-report/{user_id}")
+async def get_weekly_report(
+    user_id: int,
+    start_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    _: User = Depends(get_current_superuser),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """
+    Obtener reporte semanal de un usuario con horas trabajadas.
+    Por defecto: sábado a viernes de la semana actual.
+    """
+    # Calcular fechas por defecto (sábado a viernes)
+    if not start_date or not end_date:
+        today = date.today()
+        # Encontrar el sábado más reciente
+        days_since_saturday = (today.weekday() + 2) % 7
+        last_saturday = today - timedelta(days=days_since_saturday)
+        next_friday = last_saturday + timedelta(days=6)
+        
+        start_date_obj = datetime.combine(last_saturday, datetime.min.time())
+        end_date_obj = datetime.combine(next_friday, datetime.max.time())
+    else:
+        start_date_obj = datetime.strptime(start_date, "%Y-%m-%d")
+        end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    
+    # Obtener usuario
+    user_result = await session.execute(select(User).where(User.id == user_id))
+    user = user_result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Obtener todas las marcas en el rango de fechas
+    result = await session.execute(
+        select(Mark)
+        .where(
+            and_(
+                Mark.user_id == user_id,
+                Mark.timestamp >= start_date_obj,
+                Mark.timestamp <= end_date_obj
+            )
+        )
+        .order_by(Mark.timestamp.asc())
+    )
+    marks = result.scalars().all()
+    
+    # Agrupar marcas por día y emparejar clock_in con clock_out
+    daily_sessions = {}
+    
+    for mark in marks:
+        day_key = mark.timestamp.date().isoformat()
+        
+        if day_key not in daily_sessions:
+            daily_sessions[day_key] = {
+                "date": day_key,
+                "sessions": [],
+                "total_hours": 0
+            }
+        
+        if mark.mark_type == MarkType.CLOCK_IN:
+            # Agregar nueva sesión con clock_in
+            daily_sessions[day_key]["sessions"].append({
+                "clock_in": {
+                    "id": mark.id,
+                    "timestamp": mark.timestamp.isoformat(),
+                    "address": mark.address,
+                    "po_number": mark.po_number,
+                    "latitude": mark.latitude,
+                    "longitude": mark.longitude
+                },
+                "clock_out": None,
+                "hours_worked": 0
+            })
+        elif mark.mark_type == MarkType.CLOCK_OUT:
+            # Buscar la última sesión sin clock_out
+            sessions = daily_sessions[day_key]["sessions"]
+            for session in reversed(sessions):
+                if session["clock_out"] is None:
+                    session["clock_out"] = {
+                        "id": mark.id,
+                        "timestamp": mark.timestamp.isoformat(),
+                        "address": mark.address,
+                        "po_number": mark.po_number,
+                        "latitude": mark.latitude,
+                        "longitude": mark.longitude
+                    }
+                    
+                    # Calcular horas trabajadas
+                    clock_in_time = datetime.fromisoformat(session["clock_in"]["timestamp"])
+                    clock_out_time = mark.timestamp
+                    hours_worked = (clock_out_time - clock_in_time).total_seconds() / 3600
+                    session["hours_worked"] = round(hours_worked, 2)
+                    daily_sessions[day_key]["total_hours"] += hours_worked
+                    break
+    
+    # Calcular total de horas de la semana
+    total_week_hours = sum(day["total_hours"] for day in daily_sessions.values())
+    
+    # Convertir a lista ordenada por fecha
+    daily_list = sorted(daily_sessions.values(), key=lambda x: x["date"])
+    
+    return {
+        "user_id": user_id,
+        "user_email": user.email,
+        "user_name": f"{user.first_name or ''} {user.last_name or ''}".strip() or user.email,
+        "start_date": start_date_obj.date().isoformat(),
+        "end_date": end_date_obj.date().isoformat(),
+        "daily_reports": daily_list,
+        "total_hours": round(total_week_hours, 2)
+    }
 
