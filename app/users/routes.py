@@ -8,7 +8,7 @@ from app.db.postgres_connector import get_async_session
 from app.users.schemas import UserRead, UserCreate, UserUpdate
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.dependencies import get_env_vars
-from app.users.manager import get_user_manager
+from app.users.manager import get_user_manager, get_user_db, UserManager
 
 env = get_env_vars()
 
@@ -47,9 +47,20 @@ admin_router = APIRouter(prefix="/admin", tags=["admin"])
 @admin_router.post("/users", response_model=UserRead)
 async def create_user(
     user_create: UserCreate,
-    user_db: SQLAlchemyUserDatabase = Depends(get_user_manager),  # Importante para futuros usos
+    user_manager: UserManager = Depends(get_user_manager),
     _: User = Depends(get_current_superuser),  # Solo superusers pueden crear usuarios
 ):
     """Crear un nuevo usuario (solo admin)"""
-    user_dict = user_create.model_dump()
-    return await user_db.create(user_dict)
+    user = await user_manager.create(user_create)
+    return user
+
+@admin_router.get("/users", response_model=list[UserRead])
+async def get_all_users(
+    session: AsyncSession = Depends(get_async_session),
+    _: User = Depends(get_current_superuser),  # Solo superusers pueden listar usuarios
+):
+    """Obtener lista de todos los usuarios (solo admin)"""
+    from sqlalchemy import select
+    result = await session.execute(select(User))
+    users = result.scalars().all()
+    return users
