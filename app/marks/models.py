@@ -1,4 +1,4 @@
-from sqlalchemy import Integer, String, Float, DateTime, ForeignKey, Enum as SQLEnum
+from sqlalchemy import Integer, String, Float, DateTime, ForeignKey, Enum as SQLEnum, Index
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from datetime import datetime
 from app.db.postgres_connector import Base
@@ -14,9 +14,9 @@ class Mark(Base):
     __tablename__ = "marks"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("user.id"), nullable=False)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("user.id"), nullable=False, index=True)
     mark_type: Mapped[MarkType] = mapped_column(SQLEnum(MarkType), nullable=False)
-    timestamp: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
     latitude: Mapped[float] = mapped_column(Float, nullable=False)
     longitude: Mapped[float] = mapped_column(Float, nullable=False)
     address: Mapped[str] = mapped_column(String(500), nullable=True)
@@ -24,4 +24,12 @@ class Mark(Base):
     
     # Relationship
     user: Mapped["User"] = relationship("User", back_populates="marks")
+    
+    # Índices compuestos para optimizar consultas comunes
+    __table_args__ = (
+        # Índice para consultas por usuario y fecha (usado en reportes y filtros)
+        Index('idx_marks_user_timestamp', 'user_id', 'timestamp'),
+        # Índice para consultas por usuario, tipo y fecha
+        Index('idx_marks_user_type_timestamp', 'user_id', 'mark_type', 'timestamp'),
+    )
 

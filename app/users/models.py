@@ -13,5 +13,6 @@ class User(SQLAlchemyBaseUserTable[int], Base):
     first_name: Mapped[Optional[str]] = mapped_column(String(length=255), nullable=True)
     last_name: Mapped[Optional[str]] = mapped_column(String(length=255), nullable=True)
     
-    # Relationship
-    marks: Mapped[list["Mark"]] = relationship("Mark", back_populates="user", lazy="selectin")
+    # Relationship (lazy="noload" para evitar cargar todas las marcas automáticamente)
+    # Usar joinedload() o selectinload() explícitamente cuando se necesiten las marcas
+    marks: Mapped[list["Mark"]] = relationship("Mark", back_populates="user", lazy="noload")

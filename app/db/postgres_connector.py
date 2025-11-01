@@ -1,6 +1,5 @@
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
-from sqlalchemy.pool import NullPool
 from typing import AsyncGenerator
 from app.core.dependencies import get_env_vars
 import logging
@@ -33,11 +32,14 @@ def clean_postgres_url(url: str) -> str:
     
     return cleaned_url
 
-# Engine async para PostgreSQL
+# Engine async para PostgreSQL con connection pooling optimizado
 engine = create_async_engine(
     clean_postgres_url(env.POSTGRES_DATABASE_URL),
-    poolclass=NullPool,  # Mejor para FastAPI/Uvicorn multiple workers
-    echo=False  # True para ver SQL queries (desarrollo)
+    pool_size=10,           # Mantener 10 conexiones abiertas permanentemente
+    max_overflow=20,        # Hasta 20 conexiones adicionales bajo demanda
+    pool_pre_ping=True,     # Verificar que la conexión esté viva antes de usar
+    pool_recycle=3600,      # Reciclar conexiones cada hora (evita conexiones stale)
+    echo=False              # True para ver SQL queries (desarrollo)
 )
 
 # Session factory

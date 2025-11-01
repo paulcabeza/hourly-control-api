@@ -9,8 +9,11 @@ from app.marks.schemas import MarkCreate, MarkRead, MarkWithUser
 from app.users.models import User
 from app.users.routes import get_current_user, get_current_superuser
 import httpx
+import asyncio
+import logging
 
 router = APIRouter(prefix="/marks", tags=["marks"])
+logger = logging.getLogger(__name__)
 
 
 async def get_address_from_coords(latitude: float, longitude: float) -> str:
@@ -33,9 +36,32 @@ async def get_address_from_coords(latitude: float, longitude: float) -> str:
                 data = response.json()
                 return data.get("display_name", "Unknown location")
     except Exception as e:
-        print(f"Error getting address: {e}")
+        logger.warning(f"Error getting address: {e}")
     
     return f"Lat: {latitude:.6f}, Lon: {longitude:.6f}"
+
+
+async def update_mark_address_background(mark_id: int, latitude: float, longitude: float):
+    """
+    Actualiza la dirección de una marca en background (no bloquea la respuesta)
+    """
+    try:
+        # Obtener dirección desde coordenadas
+        address = await get_address_from_coords(latitude, longitude)
+        
+        # Actualizar la marca en la base de datos
+        async with get_async_session().__anext__() as session:
+            result = await session.execute(
+                select(Mark).where(Mark.id == mark_id)
+            )
+            mark = result.scalar_one_or_none()
+            
+            if mark:
+                mark.address = address
+                await session.commit()
+                logger.info(f"Address updated for mark {mark_id}: {address}")
+    except Exception as e:
+        logger.error(f"Error updating address for mark {mark_id}: {e}")
 
 
 @router.post("/clock-in", response_model=MarkRead)
@@ -49,23 +75,28 @@ async def clock_in(
     if mark_data.mark_type != MarkType.CLOCK_IN:
         raise HTTPException(status_code=400, detail="Mark type must be 'clock_in'")
     
-    # Obtener dirección desde coordenadas
-    address = await get_address_from_coords(mark_data.latitude, mark_data.longitude)
+    # Crear la marca con dirección temporal (coordenadas)
+    # La dirección real se actualizará en background
+    temp_address = f"Lat: {mark_data.latitude:.6f}, Lon: {mark_data.longitude:.6f}"
     
-    # Crear la marca
     new_mark = Mark(
         user_id=current_user.id,
         mark_type=MarkType.CLOCK_IN,
         timestamp=datetime.utcnow(),
         latitude=mark_data.latitude,
         longitude=mark_data.longitude,
-        address=address,
+        address=temp_address,
         po_number=mark_data.po_number
     )
     
     session.add(new_mark)
     await session.commit()
     await session.refresh(new_mark)
+    
+    # Actualizar dirección en background (no bloquea la respuesta)
+    asyncio.create_task(
+        update_mark_address_background(new_mark.id, mark_data.latitude, mark_data.longitude)
+    )
     
     return new_mark
 
@@ -81,23 +112,28 @@ async def clock_out(
     if mark_data.mark_type != MarkType.CLOCK_OUT:
         raise HTTPException(status_code=400, detail="Mark type must be 'clock_out'")
     
-    # Obtener dirección desde coordenadas
-    address = await get_address_from_coords(mark_data.latitude, mark_data.longitude)
+    # Crear la marca con dirección temporal (coordenadas)
+    # La dirección real se actualizará en background
+    temp_address = f"Lat: {mark_data.latitude:.6f}, Lon: {mark_data.longitude:.6f}"
     
-    # Crear la marca
     new_mark = Mark(
         user_id=current_user.id,
         mark_type=MarkType.CLOCK_OUT,
         timestamp=datetime.utcnow(),
         latitude=mark_data.latitude,
         longitude=mark_data.longitude,
-        address=address,
+        address=temp_address,
         po_number=mark_data.po_number
     )
     
     session.add(new_mark)
     await session.commit()
     await session.refresh(new_mark)
+    
+    # Actualizar dirección en background (no bloquea la respuesta)
+    asyncio.create_task(
+        update_mark_address_background(new_mark.id, mark_data.latitude, mark_data.longitude)
+    )
     
     return new_mark
 
