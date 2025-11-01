@@ -1,0 +1,66 @@
+# --- Python/Build ---
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# --- Virtual Environments ---
+.venv/
+venv/
+env/
+ENV/
+.pyenv/
+.python-version
+
+# --- Config/Secrets ---
+.env
+.env.*
+!.env.example
+.envrc
+
+# --- FastAPI / Uvicorn ---
+# Temporal Files: Logs and Execution Files
+*.log
+logs/
+
+# --- Tests/Coverage ---
+.pytest_cache/
+.coverage
+.coverage.*
+.cache/
+htmlcov/
+coverage.xml
+pytestdebug.log
+
+# --- Linters/Type checkers ---
+.mypy_cache/
+.dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# --- IDE/Editor ---
+.vscode/
+.idea/
+*.iml
+.history/
+*.swp
+*.swo
+
+# --- Operating Systems ---
+.DS_Store
+Thumbs.db
+
+# --- Local Databases ---
+*.db
+*.sqlite3
+*.sqlite
+*.db.sqlite3
+*.db.sqlite
+*.db.sqlite3.db
+*.db.sqlite.db
+*.db.sqlite3.sqlite
+*.db.sqlite.sqlite
