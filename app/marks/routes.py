@@ -253,54 +253,60 @@ async def get_weekly_report(
     )
     marks = result.scalars().all()
     
-    # Agrupar marcas por día y emparejar clock_in con clock_out
-    daily_sessions = {}
-    
+    # Agrupar y emparejar clock in/out permitiendo cruces de medianoche
+    daily_sessions: dict[str, dict] = {}
+    # Pila de sesiones abiertas (clock_in sin clock_out) durante el recorrido cronológico
+    open_sessions_stack: list[tuple[str, dict]] = []  # (day_key_del_clock_in, session_ref)
+
     for mark in marks:
+        # Calcular la llave del día para la vista (se agrupa por fecha del evento)
         day_key = mark.timestamp.date().isoformat()
-        
+
         if day_key not in daily_sessions:
             daily_sessions[day_key] = {
                 "date": day_key,
                 "sessions": [],
-                "total_hours": 0
+                "total_hours": 0,
             }
-        
+
         if mark.mark_type == MarkType.CLOCK_IN:
-            # Agregar nueva sesión con clock_in
-            daily_sessions[day_key]["sessions"].append({
+            # Crear la sesión y guardar referencia en la pila para un futuro CLOCK_OUT
+            session_obj = {
                 "clock_in": {
                     "id": mark.id,
                     "timestamp": mark.timestamp.isoformat(),
                     "address": mark.address,
                     "po_number": mark.po_number,
                     "latitude": mark.latitude,
-                    "longitude": mark.longitude
+                    "longitude": mark.longitude,
                 },
                 "clock_out": None,
-                "hours_worked": 0
-            })
+                "hours_worked": 0,
+            }
+            daily_sessions[day_key]["sessions"].append(session_obj)
+            open_sessions_stack.append((day_key, session_obj))
         elif mark.mark_type == MarkType.CLOCK_OUT:
-            # Buscar la última sesión sin clock_out
-            sessions = daily_sessions[day_key]["sessions"]
-            for session in reversed(sessions):
-                if session["clock_out"] is None:
-                    session["clock_out"] = {
+            # Emparejar con el último clock_in abierto, aunque sea de otro día
+            while open_sessions_stack:
+                in_day_key, session_ref = open_sessions_stack.pop()
+                if session_ref.get("clock_out") is None:
+                    session_ref["clock_out"] = {
                         "id": mark.id,
                         "timestamp": mark.timestamp.isoformat(),
                         "address": mark.address,
                         "po_number": mark.po_number,
                         "latitude": mark.latitude,
-                        "longitude": mark.longitude
+                        "longitude": mark.longitude,
                     }
-                    
-                    # Calcular horas trabajadas
-                    clock_in_time = datetime.fromisoformat(session["clock_in"]["timestamp"])
+
+                    # Calcular horas trabajadas y sumar al día del clock_in
+                    clock_in_time = datetime.fromisoformat(session_ref["clock_in"]["timestamp"])
                     clock_out_time = mark.timestamp
                     hours_worked = (clock_out_time - clock_in_time).total_seconds() / 3600
-                    session["hours_worked"] = round(hours_worked, 2)
-                    daily_sessions[day_key]["total_hours"] += hours_worked
+                    session_ref["hours_worked"] = round(hours_worked, 2)
+                    daily_sessions[in_day_key]["total_hours"] += hours_worked
                     break
+            # Si no hay clock_in abierto, ignoramos este clock_out "huérfano"
     
     # Calcular total de horas de la semana
     total_week_hours = sum(day["total_hours"] for day in daily_sessions.values())
@@ -341,12 +347,10 @@ async def update_mark(
     
     # Actualizar campos si se proporcionan
     if mark_update.timestamp is not None:
-        # Convertir a UTC naive datetime (best practice: almacenar siempre en UTC)
+        # Guardar como NAIVE LOCAL: si viene con tz, quitar tz sin convertir
         timestamp = mark_update.timestamp
         if timestamp.tzinfo is not None:
-            # Si tiene timezone, convertir a UTC y luego remover timezone
-            timestamp = timestamp.astimezone(timezone.utc).replace(tzinfo=None)
-        # Si ya es naive, asumir que es UTC (que es lo que envía el frontend)
+            timestamp = timestamp.replace(tzinfo=None)
         mark.timestamp = timestamp
     if mark_update.latitude is not None:
         mark.latitude = mark_update.latitude
@@ -390,8 +394,8 @@ async def create_mark_admin(
     # Normalizar timestamp a UTC naive (best practice)
     timestamp = mark_data.timestamp
     if timestamp.tzinfo is not None:
-        # Si tiene timezone, convertir a UTC y luego remover timezone
-        timestamp = timestamp.astimezone(timezone.utc).replace(tzinfo=None)
+        # Guardar como NAIVE LOCAL: quitar tz sin convertir
+        timestamp = timestamp.replace(tzinfo=None)
     
     # Crear la marca con dirección temporal
     temp_address = f"Lat: {mark_data.latitude:.6f}, Lon: {mark_data.longitude:.6f}"
