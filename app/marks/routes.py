@@ -1,11 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from typing import List, Optional
 from app.db.postgres_connector import get_async_session
 from app.marks.models import Mark, MarkType
-from app.marks.schemas import MarkCreate, MarkRead, MarkWithUser
+from app.marks.schemas import MarkCreate, MarkRead, MarkWithUser, MarkUpdate, MarkCreateAdmin
 from app.users.models import User
 from app.users.routes import get_current_user, get_current_superuser
 import httpx
@@ -317,4 +317,126 @@ async def get_weekly_report(
         "daily_reports": daily_list,
         "total_hours": round(total_week_hours, 2)
     }
+
+
+@router.put("/{mark_id}", response_model=MarkRead)
+async def update_mark(
+    mark_id: int,
+    mark_update: MarkUpdate,
+    _: User = Depends(get_current_superuser),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """
+    Actualizar una marca existente (solo admin).
+    Permite actualizar timestamp, coordenadas, dirección y PO number.
+    """
+    # Obtener la marca
+    result = await session.execute(
+        select(Mark).where(Mark.id == mark_id)
+    )
+    mark = result.scalar_one_or_none()
+    
+    if not mark:
+        raise HTTPException(status_code=404, detail="Mark not found")
+    
+    # Actualizar campos si se proporcionan
+    if mark_update.timestamp is not None:
+        # Convertir a UTC naive datetime (best practice: almacenar siempre en UTC)
+        timestamp = mark_update.timestamp
+        if timestamp.tzinfo is not None:
+            # Si tiene timezone, convertir a UTC y luego remover timezone
+            timestamp = timestamp.astimezone(timezone.utc).replace(tzinfo=None)
+        # Si ya es naive, asumir que es UTC (que es lo que envía el frontend)
+        mark.timestamp = timestamp
+    if mark_update.latitude is not None:
+        mark.latitude = mark_update.latitude
+    if mark_update.longitude is not None:
+        mark.longitude = mark_update.longitude
+    if mark_update.address is not None:
+        mark.address = mark_update.address
+    if mark_update.po_number is not None:
+        mark.po_number = mark_update.po_number
+    
+    # Si se actualizaron coordenadas pero no la dirección, actualizar la dirección
+    if (mark_update.latitude is not None or mark_update.longitude is not None) and mark_update.address is None:
+        asyncio.create_task(
+            update_mark_address_background(mark.id, mark.latitude, mark.longitude)
+        )
+        # Usar dirección temporal mientras se actualiza
+        mark.address = f"Lat: {mark.latitude:.6f}, Lon: {mark.longitude:.6f}"
+    
+    await session.commit()
+    await session.refresh(mark)
+    
+    return mark
+
+
+@router.post("/create", response_model=MarkRead)
+async def create_mark_admin(
+    mark_data: MarkCreateAdmin,
+    _: User = Depends(get_current_superuser),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """
+    Crear una marca manualmente (solo admin).
+    Útil para agregar clock out faltantes o corregir registros.
+    """
+    # Verificar que el usuario existe
+    user_result = await session.execute(select(User).where(User.id == mark_data.user_id))
+    user = user_result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Normalizar timestamp a UTC naive (best practice)
+    timestamp = mark_data.timestamp
+    if timestamp.tzinfo is not None:
+        # Si tiene timezone, convertir a UTC y luego remover timezone
+        timestamp = timestamp.astimezone(timezone.utc).replace(tzinfo=None)
+    
+    # Crear la marca con dirección temporal
+    temp_address = f"Lat: {mark_data.latitude:.6f}, Lon: {mark_data.longitude:.6f}"
+    
+    new_mark = Mark(
+        user_id=mark_data.user_id,
+        mark_type=mark_data.mark_type,
+        timestamp=timestamp,  # UTC naive
+        latitude=mark_data.latitude,
+        longitude=mark_data.longitude,
+        address=temp_address,
+        po_number=mark_data.po_number
+    )
+    
+    session.add(new_mark)
+    await session.commit()
+    await session.refresh(new_mark)
+    
+    # Actualizar dirección en background
+    asyncio.create_task(
+        update_mark_address_background(new_mark.id, mark_data.latitude, mark_data.longitude)
+    )
+    
+    return new_mark
+
+
+@router.delete("/{mark_id}")
+async def delete_mark(
+    mark_id: int,
+    _: User = Depends(get_current_superuser),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """
+    Eliminar una marca (solo admin).
+    """
+    result = await session.execute(
+        select(Mark).where(Mark.id == mark_id)
+    )
+    mark = result.scalar_one_or_none()
+    
+    if not mark:
+        raise HTTPException(status_code=404, detail="Mark not found")
+    
+    await session.delete(mark)
+    await session.commit()
+    
+    return {"message": "Mark deleted successfully"}
 

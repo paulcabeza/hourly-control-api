@@ -27,6 +27,25 @@ class MarkRead(BaseModel):
         from_attributes = True
 
 
+class MarkUpdate(BaseModel):
+    """Schema para actualizar una marca existente"""
+    timestamp: Optional[datetime] = None
+    latitude: Optional[float] = Field(None, ge=-90, le=90, description="Latitude between -90 and 90")
+    longitude: Optional[float] = Field(None, ge=-180, le=180, description="Longitude between -180 and 180")
+    address: Optional[str] = None
+    po_number: Optional[str] = Field(None, max_length=100, description="Purchase Order number")
+
+
+class MarkCreateAdmin(BaseModel):
+    """Schema para crear una marca manualmente (solo admin)"""
+    user_id: int
+    mark_type: MarkType
+    timestamp: datetime
+    latitude: float = Field(..., ge=-90, le=90, description="Latitude between -90 and 90")
+    longitude: float = Field(..., ge=-180, le=180, description="Longitude between -180 and 180")
+    po_number: Optional[str] = Field(None, max_length=100, description="Purchase Order number")
+
+
 class MarkWithUser(MarkRead):
     """Schema para marca con información del usuario"""
     user_email: str
