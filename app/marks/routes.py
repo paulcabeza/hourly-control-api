@@ -212,6 +212,7 @@ async def get_weekly_report(
     user_id: int,
     start_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    timezone_offset_minutes: Optional[int] = Query(None, description="Client timezone offset in minutes (UTC - local)"),
     _: User = Depends(get_current_superuser),
     session: AsyncSession = Depends(get_async_session)
 ):
@@ -231,7 +232,13 @@ async def get_weekly_report(
         end_date_obj = datetime.combine(next_friday, datetime.max.time())
     else:
         start_date_obj = datetime.strptime(start_date, "%Y-%m-%d")
-        end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+        end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59, microsecond=999999)
+
+    # Ajustar el rango al huso horario del cliente si se proporciona
+    if timezone_offset_minutes is not None:
+        offset_delta = timedelta(minutes=timezone_offset_minutes)
+        start_date_obj = start_date_obj + offset_delta
+        end_date_obj = end_date_obj + offset_delta
     
     # Obtener usuario
     user_result = await session.execute(select(User).where(User.id == user_id))
