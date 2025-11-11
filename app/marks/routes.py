@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
 from datetime import datetime, timedelta, date, timezone
 from typing import List, Optional
-from app.db.postgres_connector import get_async_session
+from app.db.postgres_connector import get_async_session, AsyncSessionLocal
 from app.marks.models import Mark, MarkType
 from app.marks.schemas import MarkCreate, MarkRead, MarkWithUser, MarkUpdate, MarkCreateAdmin
 from app.users.models import User
@@ -50,7 +50,7 @@ async def update_mark_address_background(mark_id: int, latitude: float, longitud
         address = await get_address_from_coords(latitude, longitude)
         
         # Actualizar la marca en la base de datos
-        async with get_async_session().__anext__() as session:
+        async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(Mark).where(Mark.id == mark_id)
             )
