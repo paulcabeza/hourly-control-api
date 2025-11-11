@@ -8,7 +8,7 @@ from app.marks.models import Mark, MarkType
 from app.marks.schemas import MarkCreate, MarkRead, MarkWithUser, MarkUpdate, MarkCreateAdmin
 from app.users.models import User
 from app.users.routes import get_current_user, get_current_superuser
-import httpx
+import httpx  # type: ignore
 import asyncio
 import logging
 
@@ -62,6 +62,107 @@ async def update_mark_address_background(mark_id: int, latitude: float, longitud
                 logger.info(f"Address updated for mark {mark_id}: {address}")
     except Exception as e:
         logger.error(f"Error updating address for mark {mark_id}: {e}")
+
+
+async def validate_clock_out_timestamp(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    timestamp: datetime,
+    clock_in_id: Optional[int] = None,
+    exclude_mark_id: Optional[int] = None
+) -> tuple[Mark, Optional[Mark]]:
+    """
+    Valida que un registro de clock out no se sobreponga con otros clock in/out.
+    Devuelve la marca de clock in asociada y el siguiente clock in (si existe).
+    """
+    # Obtener el clock in de referencia
+    if clock_in_id is not None:
+        clock_in_result = await session.execute(
+            select(Mark).where(
+                Mark.id == clock_in_id,
+                Mark.user_id == user_id,
+                Mark.mark_type == MarkType.CLOCK_IN
+            )
+        )
+        base_clock_in = clock_in_result.scalar_one_or_none()
+        if not base_clock_in:
+            raise HTTPException(
+                status_code=400,
+                detail="Clock in reference not found for this clock out."
+            )
+    else:
+        clock_in_result = await session.execute(
+            select(Mark)
+            .where(
+                Mark.user_id == user_id,
+                Mark.mark_type == MarkType.CLOCK_IN,
+                Mark.timestamp <= timestamp
+            )
+            .order_by(Mark.timestamp.desc())
+            .limit(1)
+        )
+        base_clock_in = clock_in_result.scalar_one_or_none()
+        if not base_clock_in:
+            raise HTTPException(
+                status_code=400,
+                detail="Clock out requires an earlier clock in."
+            )
+
+    if timestamp <= base_clock_in.timestamp:
+        raise HTTPException(
+            status_code=400,
+            detail="Clock out must occur after its reference clock in."
+        )
+
+    # Encontrar el siguiente clock in después del clock in de referencia
+    next_clock_in_result = await session.execute(
+        select(Mark)
+        .where(
+            Mark.user_id == user_id,
+            Mark.mark_type == MarkType.CLOCK_IN,
+            Mark.timestamp > base_clock_in.timestamp
+        )
+        .order_by(Mark.timestamp)
+        .limit(1)
+    )
+    next_clock_in = next_clock_in_result.scalar_one_or_none()
+
+    if next_clock_in and timestamp >= next_clock_in.timestamp:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Clock out overlaps with the next clock in at "
+                f"{next_clock_in.timestamp.isoformat()}."
+            )
+        )
+
+    # Validar que no exista ya un clock out en el intervalo
+    overlap_query = (
+        select(Mark)
+        .where(
+            Mark.user_id == user_id,
+            Mark.mark_type == MarkType.CLOCK_OUT,
+            Mark.timestamp > base_clock_in.timestamp
+        )
+    )
+    if exclude_mark_id is not None:
+        overlap_query = overlap_query.where(Mark.id != exclude_mark_id)
+    if next_clock_in:
+        overlap_query = overlap_query.where(Mark.timestamp < next_clock_in.timestamp)
+
+    overlap_result = await session.execute(
+        overlap_query.order_by(Mark.timestamp).limit(1)
+    )
+    overlap_mark = overlap_result.scalar_one_or_none()
+
+    if overlap_mark:
+        raise HTTPException(
+            status_code=400,
+            detail="There is already a clock out registered for that interval."
+        )
+
+    return base_clock_in, next_clock_in
 
 
 @router.post("/clock-in", response_model=MarkRead)
@@ -353,12 +454,14 @@ async def update_mark(
         raise HTTPException(status_code=404, detail="Mark not found")
     
     # Actualizar campos si se proporcionan
+    new_timestamp = mark.timestamp
     if mark_update.timestamp is not None:
         # Guardar como NAIVE LOCAL: si viene con tz, quitar tz sin convertir
         timestamp = mark_update.timestamp
         if timestamp.tzinfo is not None:
             timestamp = timestamp.replace(tzinfo=None)
         mark.timestamp = timestamp
+        new_timestamp = timestamp
     if mark_update.latitude is not None:
         mark.latitude = mark_update.latitude
     if mark_update.longitude is not None:
@@ -368,6 +471,29 @@ async def update_mark(
     if mark_update.po_number is not None:
         mark.po_number = mark_update.po_number
     
+    # Validar que el clock out no se sobreponga con otros registros
+    if mark.mark_type == MarkType.CLOCK_OUT and mark_update.timestamp is not None:
+        clock_in_ref_result = await session.execute(
+            select(Mark)
+            .where(
+                Mark.user_id == mark.user_id,
+                Mark.mark_type == MarkType.CLOCK_IN,
+                Mark.timestamp <= new_timestamp
+            )
+            .order_by(Mark.timestamp.desc())
+            .limit(1)
+        )
+        clock_in_ref = clock_in_ref_result.scalar_one_or_none()
+        clock_in_id = clock_in_ref.id if clock_in_ref else None
+
+        await validate_clock_out_timestamp(
+            session,
+            user_id=mark.user_id,
+            timestamp=new_timestamp,
+            clock_in_id=clock_in_id,
+            exclude_mark_id=mark.id
+        )
+
     # Si se actualizaron coordenadas pero no la dirección, actualizar la dirección
     if (mark_update.latitude is not None or mark_update.longitude is not None) and mark_update.address is None:
         asyncio.create_task(
@@ -404,6 +530,15 @@ async def create_mark_admin(
         # Guardar como NAIVE LOCAL: quitar tz sin convertir
         timestamp = timestamp.replace(tzinfo=None)
     
+    # Validaciones específicas para clock out
+    if mark_data.mark_type == MarkType.CLOCK_OUT:
+        await validate_clock_out_timestamp(
+            session,
+            user_id=mark_data.user_id,
+            timestamp=timestamp,
+            clock_in_id=mark_data.clock_in_id
+        )
+
     # Crear la marca con dirección temporal
     temp_address = f"Lat: {mark_data.latitude:.6f}, Lon: {mark_data.longitude:.6f}"
     

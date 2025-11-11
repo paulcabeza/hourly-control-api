@@ -44,6 +44,7 @@ class MarkCreateAdmin(BaseModel):
     latitude: float = Field(..., ge=-90, le=90, description="Latitude between -90 and 90")
     longitude: float = Field(..., ge=-180, le=180, description="Longitude between -180 and 180")
     po_number: Optional[str] = Field(None, max_length=100, description="Purchase Order number")
+    clock_in_id: Optional[int] = Field(None, description="Optional reference clock in for clock out creation")
 
 
 class MarkWithUser(MarkRead):
