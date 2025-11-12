@@ -469,6 +469,11 @@ async def update_mark(
     if mark_update.address is not None:
         mark.address = mark_update.address
     if mark_update.po_number is not None:
+        if mark.mark_type == MarkType.CLOCK_OUT and mark_update.po_number != mark.po_number:
+            raise HTTPException(
+                status_code=400,
+                detail="Clock out PO number must match its clock in and cannot be modified."
+            )
         mark.po_number = mark_update.po_number
     
     # Validar que el clock out no se sobreponga con otros registros
@@ -486,13 +491,15 @@ async def update_mark(
         clock_in_ref = clock_in_ref_result.scalar_one_or_none()
         clock_in_id = clock_in_ref.id if clock_in_ref else None
 
-        await validate_clock_out_timestamp(
+        base_clock_in, _ = await validate_clock_out_timestamp(
             session,
             user_id=mark.user_id,
             timestamp=new_timestamp,
             clock_in_id=clock_in_id,
             exclude_mark_id=mark.id
         )
+        if base_clock_in:
+            mark.po_number = base_clock_in.po_number
 
     # Si se actualizaron coordenadas pero no la dirección, actualizar la dirección
     if (mark_update.latitude is not None or mark_update.longitude is not None) and mark_update.address is None:
