@@ -531,13 +531,16 @@ async def create_mark_admin(
         timestamp = timestamp.replace(tzinfo=None)
     
     # Validaciones específicas para clock out
+    po_number = mark_data.po_number
     if mark_data.mark_type == MarkType.CLOCK_OUT:
-        await validate_clock_out_timestamp(
+        base_clock_in, _ = await validate_clock_out_timestamp(
             session,
             user_id=mark_data.user_id,
             timestamp=timestamp,
             clock_in_id=mark_data.clock_in_id
         )
+        # Asegurar que el clock out utiliza el mismo PO que su clock in asociado
+        po_number = base_clock_in.po_number
 
     # Crear la marca con dirección temporal
     temp_address = f"Lat: {mark_data.latitude:.6f}, Lon: {mark_data.longitude:.6f}"
@@ -549,7 +552,7 @@ async def create_mark_admin(
         latitude=mark_data.latitude,
         longitude=mark_data.longitude,
         address=temp_address,
-        po_number=mark_data.po_number
+        po_number=po_number
     )
     
     session.add(new_mark)
