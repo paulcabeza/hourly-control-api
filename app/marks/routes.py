@@ -1,14 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from typing import List, Optional
-from app.db.postgres_connector import get_async_session
+from app.db.postgres_connector import get_async_session, AsyncSessionLocal
 from app.marks.models import Mark, MarkType
-from app.marks.schemas import MarkCreate, MarkRead, MarkWithUser
+from app.marks.schemas import MarkCreate, MarkRead, MarkWithUser, MarkUpdate, MarkCreateAdmin
 from app.users.models import User
 from app.users.routes import get_current_user, get_current_superuser
-import httpx
+import httpx  # type: ignore
 import asyncio
 import logging
 
@@ -50,7 +50,7 @@ async def update_mark_address_background(mark_id: int, latitude: float, longitud
         address = await get_address_from_coords(latitude, longitude)
         
         # Actualizar la marca en la base de datos
-        async with get_async_session().__anext__() as session:
+        async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(Mark).where(Mark.id == mark_id)
             )
@@ -62,6 +62,107 @@ async def update_mark_address_background(mark_id: int, latitude: float, longitud
                 logger.info(f"Address updated for mark {mark_id}: {address}")
     except Exception as e:
         logger.error(f"Error updating address for mark {mark_id}: {e}")
+
+
+async def validate_clock_out_timestamp(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    timestamp: datetime,
+    clock_in_id: Optional[int] = None,
+    exclude_mark_id: Optional[int] = None
+) -> tuple[Mark, Optional[Mark]]:
+    """
+    Valida que un registro de clock out no se sobreponga con otros clock in/out.
+    Devuelve la marca de clock in asociada y el siguiente clock in (si existe).
+    """
+    # Obtener el clock in de referencia
+    if clock_in_id is not None:
+        clock_in_result = await session.execute(
+            select(Mark).where(
+                Mark.id == clock_in_id,
+                Mark.user_id == user_id,
+                Mark.mark_type == MarkType.CLOCK_IN
+            )
+        )
+        base_clock_in = clock_in_result.scalar_one_or_none()
+        if not base_clock_in:
+            raise HTTPException(
+                status_code=400,
+                detail="Clock in reference not found for this clock out."
+            )
+    else:
+        clock_in_result = await session.execute(
+            select(Mark)
+            .where(
+                Mark.user_id == user_id,
+                Mark.mark_type == MarkType.CLOCK_IN,
+                Mark.timestamp <= timestamp
+            )
+            .order_by(Mark.timestamp.desc())
+            .limit(1)
+        )
+        base_clock_in = clock_in_result.scalar_one_or_none()
+        if not base_clock_in:
+            raise HTTPException(
+                status_code=400,
+                detail="Clock out requires an earlier clock in."
+            )
+
+    if timestamp <= base_clock_in.timestamp:
+        raise HTTPException(
+            status_code=400,
+            detail="Clock out must occur after its reference clock in."
+        )
+
+    # Encontrar el siguiente clock in después del clock in de referencia
+    next_clock_in_result = await session.execute(
+        select(Mark)
+        .where(
+            Mark.user_id == user_id,
+            Mark.mark_type == MarkType.CLOCK_IN,
+            Mark.timestamp > base_clock_in.timestamp
+        )
+        .order_by(Mark.timestamp)
+        .limit(1)
+    )
+    next_clock_in = next_clock_in_result.scalar_one_or_none()
+
+    if next_clock_in and timestamp >= next_clock_in.timestamp:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Clock out overlaps with the next clock in at "
+                f"{next_clock_in.timestamp.isoformat()}."
+            )
+        )
+
+    # Validar que no exista ya un clock out en el intervalo
+    overlap_query = (
+        select(Mark)
+        .where(
+            Mark.user_id == user_id,
+            Mark.mark_type == MarkType.CLOCK_OUT,
+            Mark.timestamp > base_clock_in.timestamp
+        )
+    )
+    if exclude_mark_id is not None:
+        overlap_query = overlap_query.where(Mark.id != exclude_mark_id)
+    if next_clock_in:
+        overlap_query = overlap_query.where(Mark.timestamp < next_clock_in.timestamp)
+
+    overlap_result = await session.execute(
+        overlap_query.order_by(Mark.timestamp).limit(1)
+    )
+    overlap_mark = overlap_result.scalar_one_or_none()
+
+    if overlap_mark:
+        raise HTTPException(
+            status_code=400,
+            detail="There is already a clock out registered for that interval."
+        )
+
+    return base_clock_in, next_clock_in
 
 
 @router.post("/clock-in", response_model=MarkRead)
@@ -212,6 +313,7 @@ async def get_weekly_report(
     user_id: int,
     start_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    timezone_offset_minutes: Optional[int] = Query(None, description="Client timezone offset in minutes (UTC - local)"),
     _: User = Depends(get_current_superuser),
     session: AsyncSession = Depends(get_async_session)
 ):
@@ -231,7 +333,13 @@ async def get_weekly_report(
         end_date_obj = datetime.combine(next_friday, datetime.max.time())
     else:
         start_date_obj = datetime.strptime(start_date, "%Y-%m-%d")
-        end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+        end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59, microsecond=999999)
+
+    # Ajustar el rango al huso horario del cliente si se proporciona
+    if timezone_offset_minutes is not None:
+        offset_delta = timedelta(minutes=timezone_offset_minutes)
+        start_date_obj = start_date_obj + offset_delta
+        end_date_obj = end_date_obj + offset_delta
     
     # Obtener usuario
     user_result = await session.execute(select(User).where(User.id == user_id))
@@ -253,54 +361,60 @@ async def get_weekly_report(
     )
     marks = result.scalars().all()
     
-    # Agrupar marcas por día y emparejar clock_in con clock_out
-    daily_sessions = {}
-    
+    # Agrupar y emparejar clock in/out permitiendo cruces de medianoche
+    daily_sessions: dict[str, dict] = {}
+    # Pila de sesiones abiertas (clock_in sin clock_out) durante el recorrido cronológico
+    open_sessions_stack: list[tuple[str, dict]] = []  # (day_key_del_clock_in, session_ref)
+
     for mark in marks:
+        # Calcular la llave del día para la vista (se agrupa por fecha del evento)
         day_key = mark.timestamp.date().isoformat()
-        
+
         if day_key not in daily_sessions:
             daily_sessions[day_key] = {
                 "date": day_key,
                 "sessions": [],
-                "total_hours": 0
+                "total_hours": 0,
             }
-        
+
         if mark.mark_type == MarkType.CLOCK_IN:
-            # Agregar nueva sesión con clock_in
-            daily_sessions[day_key]["sessions"].append({
+            # Crear la sesión y guardar referencia en la pila para un futuro CLOCK_OUT
+            session_obj = {
                 "clock_in": {
                     "id": mark.id,
                     "timestamp": mark.timestamp.isoformat(),
                     "address": mark.address,
                     "po_number": mark.po_number,
                     "latitude": mark.latitude,
-                    "longitude": mark.longitude
+                    "longitude": mark.longitude,
                 },
                 "clock_out": None,
-                "hours_worked": 0
-            })
+                "hours_worked": 0,
+            }
+            daily_sessions[day_key]["sessions"].append(session_obj)
+            open_sessions_stack.append((day_key, session_obj))
         elif mark.mark_type == MarkType.CLOCK_OUT:
-            # Buscar la última sesión sin clock_out
-            sessions = daily_sessions[day_key]["sessions"]
-            for session in reversed(sessions):
-                if session["clock_out"] is None:
-                    session["clock_out"] = {
+            # Emparejar con el último clock_in abierto, aunque sea de otro día
+            while open_sessions_stack:
+                in_day_key, session_ref = open_sessions_stack.pop()
+                if session_ref.get("clock_out") is None:
+                    session_ref["clock_out"] = {
                         "id": mark.id,
                         "timestamp": mark.timestamp.isoformat(),
                         "address": mark.address,
                         "po_number": mark.po_number,
                         "latitude": mark.latitude,
-                        "longitude": mark.longitude
+                        "longitude": mark.longitude,
                     }
-                    
-                    # Calcular horas trabajadas
-                    clock_in_time = datetime.fromisoformat(session["clock_in"]["timestamp"])
+
+                    # Calcular horas trabajadas y sumar al día del clock_in
+                    clock_in_time = datetime.fromisoformat(session_ref["clock_in"]["timestamp"])
                     clock_out_time = mark.timestamp
                     hours_worked = (clock_out_time - clock_in_time).total_seconds() / 3600
-                    session["hours_worked"] = round(hours_worked, 2)
-                    daily_sessions[day_key]["total_hours"] += hours_worked
+                    session_ref["hours_worked"] = round(hours_worked, 2)
+                    daily_sessions[in_day_key]["total_hours"] += hours_worked
                     break
+            # Si no hay clock_in abierto, ignoramos este clock_out "huérfano"
     
     # Calcular total de horas de la semana
     total_week_hours = sum(day["total_hours"] for day in daily_sessions.values())
@@ -317,4 +431,168 @@ async def get_weekly_report(
         "daily_reports": daily_list,
         "total_hours": round(total_week_hours, 2)
     }
+
+
+@router.put("/{mark_id}", response_model=MarkRead)
+async def update_mark(
+    mark_id: int,
+    mark_update: MarkUpdate,
+    _: User = Depends(get_current_superuser),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """
+    Actualizar una marca existente (solo admin).
+    Permite actualizar timestamp, coordenadas, dirección y PO number.
+    """
+    # Obtener la marca
+    result = await session.execute(
+        select(Mark).where(Mark.id == mark_id)
+    )
+    mark = result.scalar_one_or_none()
+    
+    if not mark:
+        raise HTTPException(status_code=404, detail="Mark not found")
+    
+    # Actualizar campos si se proporcionan
+    new_timestamp = mark.timestamp
+    if mark_update.timestamp is not None:
+        # Guardar como NAIVE LOCAL: si viene con tz, quitar tz sin convertir
+        timestamp = mark_update.timestamp
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.replace(tzinfo=None)
+        mark.timestamp = timestamp
+        new_timestamp = timestamp
+    if mark_update.latitude is not None:
+        mark.latitude = mark_update.latitude
+    if mark_update.longitude is not None:
+        mark.longitude = mark_update.longitude
+    if mark_update.address is not None:
+        mark.address = mark_update.address
+    if mark_update.po_number is not None:
+        if mark.mark_type == MarkType.CLOCK_OUT and mark_update.po_number != mark.po_number:
+            raise HTTPException(
+                status_code=400,
+                detail="Clock out PO number must match its clock in and cannot be modified."
+            )
+        mark.po_number = mark_update.po_number
+    
+    # Validar que el clock out no se sobreponga con otros registros
+    if mark.mark_type == MarkType.CLOCK_OUT and mark_update.timestamp is not None:
+        clock_in_ref_result = await session.execute(
+            select(Mark)
+            .where(
+                Mark.user_id == mark.user_id,
+                Mark.mark_type == MarkType.CLOCK_IN,
+                Mark.timestamp <= new_timestamp
+            )
+            .order_by(Mark.timestamp.desc())
+            .limit(1)
+        )
+        clock_in_ref = clock_in_ref_result.scalar_one_or_none()
+        clock_in_id = clock_in_ref.id if clock_in_ref else None
+
+        base_clock_in, _ = await validate_clock_out_timestamp(
+            session,
+            user_id=mark.user_id,
+            timestamp=new_timestamp,
+            clock_in_id=clock_in_id,
+            exclude_mark_id=mark.id
+        )
+        if base_clock_in:
+            mark.po_number = base_clock_in.po_number
+
+    # Si se actualizaron coordenadas pero no la dirección, actualizar la dirección
+    if (mark_update.latitude is not None or mark_update.longitude is not None) and mark_update.address is None:
+        asyncio.create_task(
+            update_mark_address_background(mark.id, mark.latitude, mark.longitude)
+        )
+        # Usar dirección temporal mientras se actualiza
+        mark.address = f"Lat: {mark.latitude:.6f}, Lon: {mark.longitude:.6f}"
+    
+    await session.commit()
+    await session.refresh(mark)
+    
+    return mark
+
+
+@router.post("/create", response_model=MarkRead)
+async def create_mark_admin(
+    mark_data: MarkCreateAdmin,
+    _: User = Depends(get_current_superuser),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """
+    Crear una marca manualmente (solo admin).
+    Útil para agregar clock out faltantes o corregir registros.
+    """
+    # Verificar que el usuario existe
+    user_result = await session.execute(select(User).where(User.id == mark_data.user_id))
+    user = user_result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Normalizar timestamp a UTC naive (best practice)
+    timestamp = mark_data.timestamp
+    if timestamp.tzinfo is not None:
+        # Guardar como NAIVE LOCAL: quitar tz sin convertir
+        timestamp = timestamp.replace(tzinfo=None)
+    
+    # Validaciones específicas para clock out
+    po_number = mark_data.po_number
+    if mark_data.mark_type == MarkType.CLOCK_OUT:
+        base_clock_in, _ = await validate_clock_out_timestamp(
+            session,
+            user_id=mark_data.user_id,
+            timestamp=timestamp,
+            clock_in_id=mark_data.clock_in_id
+        )
+        # Asegurar que el clock out utiliza el mismo PO que su clock in asociado
+        po_number = base_clock_in.po_number
+
+    # Crear la marca con dirección temporal
+    temp_address = f"Lat: {mark_data.latitude:.6f}, Lon: {mark_data.longitude:.6f}"
+    
+    new_mark = Mark(
+        user_id=mark_data.user_id,
+        mark_type=mark_data.mark_type,
+        timestamp=timestamp,  # UTC naive
+        latitude=mark_data.latitude,
+        longitude=mark_data.longitude,
+        address=temp_address,
+        po_number=po_number
+    )
+    
+    session.add(new_mark)
+    await session.commit()
+    await session.refresh(new_mark)
+    
+    # Actualizar dirección en background
+    asyncio.create_task(
+        update_mark_address_background(new_mark.id, mark_data.latitude, mark_data.longitude)
+    )
+    
+    return new_mark
+
+
+@router.delete("/{mark_id}")
+async def delete_mark(
+    mark_id: int,
+    _: User = Depends(get_current_superuser),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """
+    Eliminar una marca (solo admin).
+    """
+    result = await session.execute(
+        select(Mark).where(Mark.id == mark_id)
+    )
+    mark = result.scalar_one_or_none()
+    
+    if not mark:
+        raise HTTPException(status_code=404, detail="Mark not found")
+    
+    await session.delete(mark)
+    await session.commit()
+    
+    return {"message": "Mark deleted successfully"}
 
