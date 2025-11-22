@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 from app.marks.models import MarkType
 
 
@@ -56,3 +56,17 @@ class MarkWithUser(MarkRead):
     class Config:
         from_attributes = True
 
+
+class EmployeeSummary(BaseModel):
+    """Schema para el resumen de horas de un empleado"""
+    user_id: int
+    user_email: str
+    user_name: str
+    total_hours: float
+
+
+class EmployeesSummaryReport(BaseModel):
+    """Schema para el reporte sumario de todos los empleados"""
+    start_date: str
+    end_date: str
+    employees: List[EmployeeSummary]

@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, date, timezone
 from typing import List, Optional
 from app.db.postgres_connector import get_async_session, AsyncSessionLocal
 from app.marks.models import Mark, MarkType
-from app.marks.schemas import MarkCreate, MarkRead, MarkWithUser, MarkUpdate, MarkCreateAdmin
+from app.marks.schemas import MarkCreate, MarkRead, MarkWithUser, MarkUpdate, MarkCreateAdmin, EmployeesSummaryReport, EmployeeSummary
 from app.users.models import User
 from app.users.routes import get_current_user, get_current_superuser
 import httpx  # type: ignore
@@ -163,6 +163,75 @@ async def validate_clock_out_timestamp(
         )
 
     return base_clock_in, next_clock_in
+
+
+def _calculate_daily_sessions(marks: List[Mark]) -> tuple[List[dict], float]:
+    """
+    Calcula las sesiones diarias y el total de horas a partir de una lista de marcas.
+    Reutilizable para reporte individual y sumario.
+    """
+    # Agrupar y emparejar clock in/out permitiendo cruces de medianoche
+    daily_sessions: dict[str, dict] = {}
+    # Pila de sesiones abiertas (clock_in sin clock_out) durante el recorrido cronológico
+    open_sessions_stack: list[tuple[str, dict]] = []  # (day_key_del_clock_in, session_ref)
+
+    for mark in marks:
+        # Calcular la llave del día para la vista (se agrupa por fecha del evento)
+        day_key = mark.timestamp.date().isoformat()
+
+        if day_key not in daily_sessions:
+            daily_sessions[day_key] = {
+                "date": day_key,
+                "sessions": [],
+                "total_hours": 0,
+            }
+
+        if mark.mark_type == MarkType.CLOCK_IN:
+            # Crear la sesión y guardar referencia en la pila para un futuro CLOCK_OUT
+            session_obj = {
+                "clock_in": {
+                    "id": mark.id,
+                    "timestamp": mark.timestamp.isoformat(),
+                    "address": mark.address,
+                    "po_number": mark.po_number,
+                    "latitude": mark.latitude,
+                    "longitude": mark.longitude,
+                },
+                "clock_out": None,
+                "hours_worked": 0,
+            }
+            daily_sessions[day_key]["sessions"].append(session_obj)
+            open_sessions_stack.append((day_key, session_obj))
+        elif mark.mark_type == MarkType.CLOCK_OUT:
+            # Emparejar con el último clock_in abierto, aunque sea de otro día
+            while open_sessions_stack:
+                in_day_key, session_ref = open_sessions_stack.pop()
+                if session_ref.get("clock_out") is None:
+                    session_ref["clock_out"] = {
+                        "id": mark.id,
+                        "timestamp": mark.timestamp.isoformat(),
+                        "address": mark.address,
+                        "po_number": mark.po_number,
+                        "latitude": mark.latitude,
+                        "longitude": mark.longitude,
+                    }
+
+                    # Calcular horas trabajadas y sumar al día del clock_in
+                    clock_in_time = datetime.fromisoformat(session_ref["clock_in"]["timestamp"])
+                    clock_out_time = mark.timestamp
+                    hours_worked = (clock_out_time - clock_in_time).total_seconds() / 3600
+                    session_ref["hours_worked"] = round(hours_worked, 2)
+                    daily_sessions[in_day_key]["total_hours"] += hours_worked
+                    break
+            # Si no hay clock_in abierto, ignoramos este clock_out "huérfano"
+    
+    # Calcular total de horas de la semana
+    total_week_hours = sum(day["total_hours"] for day in daily_sessions.values())
+    
+    # Convertir a lista ordenada por fecha
+    daily_list = sorted(daily_sessions.values(), key=lambda x: x["date"])
+
+    return daily_list, round(total_week_hours, 2)
 
 
 @router.post("/clock-in", response_model=MarkRead)
@@ -361,66 +430,8 @@ async def get_weekly_report(
     )
     marks = result.scalars().all()
     
-    # Agrupar y emparejar clock in/out permitiendo cruces de medianoche
-    daily_sessions: dict[str, dict] = {}
-    # Pila de sesiones abiertas (clock_in sin clock_out) durante el recorrido cronológico
-    open_sessions_stack: list[tuple[str, dict]] = []  # (day_key_del_clock_in, session_ref)
-
-    for mark in marks:
-        # Calcular la llave del día para la vista (se agrupa por fecha del evento)
-        day_key = mark.timestamp.date().isoformat()
-
-        if day_key not in daily_sessions:
-            daily_sessions[day_key] = {
-                "date": day_key,
-                "sessions": [],
-                "total_hours": 0,
-            }
-
-        if mark.mark_type == MarkType.CLOCK_IN:
-            # Crear la sesión y guardar referencia en la pila para un futuro CLOCK_OUT
-            session_obj = {
-                "clock_in": {
-                    "id": mark.id,
-                    "timestamp": mark.timestamp.isoformat(),
-                    "address": mark.address,
-                    "po_number": mark.po_number,
-                    "latitude": mark.latitude,
-                    "longitude": mark.longitude,
-                },
-                "clock_out": None,
-                "hours_worked": 0,
-            }
-            daily_sessions[day_key]["sessions"].append(session_obj)
-            open_sessions_stack.append((day_key, session_obj))
-        elif mark.mark_type == MarkType.CLOCK_OUT:
-            # Emparejar con el último clock_in abierto, aunque sea de otro día
-            while open_sessions_stack:
-                in_day_key, session_ref = open_sessions_stack.pop()
-                if session_ref.get("clock_out") is None:
-                    session_ref["clock_out"] = {
-                        "id": mark.id,
-                        "timestamp": mark.timestamp.isoformat(),
-                        "address": mark.address,
-                        "po_number": mark.po_number,
-                        "latitude": mark.latitude,
-                        "longitude": mark.longitude,
-                    }
-
-                    # Calcular horas trabajadas y sumar al día del clock_in
-                    clock_in_time = datetime.fromisoformat(session_ref["clock_in"]["timestamp"])
-                    clock_out_time = mark.timestamp
-                    hours_worked = (clock_out_time - clock_in_time).total_seconds() / 3600
-                    session_ref["hours_worked"] = round(hours_worked, 2)
-                    daily_sessions[in_day_key]["total_hours"] += hours_worked
-                    break
-            # Si no hay clock_in abierto, ignoramos este clock_out "huérfano"
-    
-    # Calcular total de horas de la semana
-    total_week_hours = sum(day["total_hours"] for day in daily_sessions.values())
-    
-    # Convertir a lista ordenada por fecha
-    daily_list = sorted(daily_sessions.values(), key=lambda x: x["date"])
+    # Usar función helper para calcular sesiones
+    daily_list, total_week_hours = _calculate_daily_sessions(marks)
     
     return {
         "user_id": user_id,
@@ -429,8 +440,85 @@ async def get_weekly_report(
         "start_date": start_date_obj.date().isoformat(),
         "end_date": end_date_obj.date().isoformat(),
         "daily_reports": daily_list,
-        "total_hours": round(total_week_hours, 2)
+        "total_hours": total_week_hours
     }
+
+
+@router.get("/summary-report", response_model=EmployeesSummaryReport)
+async def get_employees_summary_report(
+    start_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    timezone_offset_minutes: Optional[int] = Query(None, description="Client timezone offset in minutes (UTC - local)"),
+    _: User = Depends(get_current_superuser),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """
+    Obtener un reporte sumario de horas de todos los empleados para un rango de fechas.
+    """
+    # Calcular fechas por defecto (sábado a viernes)
+    if not start_date or not end_date:
+        today = date.today()
+        # Encontrar el sábado más reciente
+        days_since_saturday = (today.weekday() + 2) % 7
+        last_saturday = today - timedelta(days=days_since_saturday)
+        next_friday = last_saturday + timedelta(days=6)
+        
+        start_date_obj = datetime.combine(last_saturday, datetime.min.time())
+        end_date_obj = datetime.combine(next_friday, datetime.max.time())
+    else:
+        start_date_obj = datetime.strptime(start_date, "%Y-%m-%d")
+        end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59, microsecond=999999)
+
+    # Ajustar el rango al huso horario del cliente si se proporciona
+    if timezone_offset_minutes is not None:
+        offset_delta = timedelta(minutes=timezone_offset_minutes)
+        start_date_obj = start_date_obj + offset_delta
+        end_date_obj = end_date_obj + offset_delta
+    
+    # Obtener todos los usuarios
+    users_result = await session.execute(select(User).order_by(User.email))
+    users = users_result.scalars().all()
+
+    employees_summary = []
+
+    # Obtener todas las marcas en el rango para todos los usuarios
+    # Optimizacion: Obtener todas las marcas de una sola vez en lugar de N queries
+    marks_result = await session.execute(
+        select(Mark)
+        .where(
+            and_(
+                Mark.timestamp >= start_date_obj,
+                Mark.timestamp <= end_date_obj
+            )
+        )
+        .order_by(Mark.user_id, Mark.timestamp.asc())
+    )
+    all_marks = marks_result.scalars().all()
+
+    # Agrupar marcas por usuario
+    marks_by_user = {}
+    for mark in all_marks:
+        if mark.user_id not in marks_by_user:
+            marks_by_user[mark.user_id] = []
+        marks_by_user[mark.user_id].append(mark)
+
+    # Calcular horas para cada usuario
+    for user in users:
+        user_marks = marks_by_user.get(user.id, [])
+        _, total_hours = _calculate_daily_sessions(user_marks)
+        
+        employees_summary.append(EmployeeSummary(
+            user_id=user.id,
+            user_email=user.email,
+            user_name=f"{user.first_name or ''} {user.last_name or ''}".strip() or user.email,
+            total_hours=total_hours
+        ))
+    
+    return EmployeesSummaryReport(
+        start_date=start_date_obj.date().isoformat(),
+        end_date=end_date_obj.date().isoformat(),
+        employees=employees_summary
+    )
 
 
 @router.put("/{mark_id}", response_model=MarkRead)
